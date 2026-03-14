@@ -2,3 +2,8 @@ flask
 requests
 selenium
 flask-cors
+psycopg2-binary
+PyPDF2
+python-dotenv
+gunicorn
+Flask-Caching
