@@ -66,16 +66,15 @@ def _fetch_cookies_via_requests():
         resp.raise_for_status()
     except requests.RequestException as e:
         raise RuntimeError(f"Failed to fetch site: {e}") from e
-
+    # session.cookies is a RequestsCookieJar
     jsession_cookie_value = session.cookies.get("JSESSIONID")
-    geNPRu9S_cookie_value = session.cookies.get("geNPRu9S")
+    geNPRu9S_cookie_value = session.cookies.get("bnxpx9vG")
     return jsession_cookie_value, geNPRu9S_cookie_value
 
 
 @app.route('/storeCookies')
 def get_cookie():
-    # Use requests instead of Selenium: Vercel has read-only filesystem and no Chrome,
-    # so Selenium/ChromeDriver cannot run. HTTP-based cookie fetch works on serverless.
+    # Use requests + RequestsCookieJar instead of Selenium (works on Vercel/serverless).
     try:
         jsession_cookie_value, geNPRu9S_cookie_value = _fetch_cookies_via_requests()
     except RuntimeError as e:
@@ -83,7 +82,7 @@ def get_cookie():
 
     if not jsession_cookie_value and not geNPRu9S_cookie_value:
         return jsonify({
-            "message": "No JSESSIONID or geNPRu9S cookies received. The site may set them via JavaScript; run /storeCookies on a host with Chrome (e.g. Lambda with chrome layer) or use a remote browser service.",
+            "message": "No JSESSIONID or geNPRu9S cookies received. The site may set them via JavaScript; run /storeCookies on a host with Chrome or use a remote browser service.",
             "code": 500,
         }), 500
 
