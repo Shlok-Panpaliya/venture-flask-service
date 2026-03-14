@@ -53,48 +53,50 @@ def test_database_connection():
         }), 500
 
 
+def _fetch_cookies_via_requests():
+    """Fetch cookies via HTTP only (works on Vercel/serverless; no Chrome needed)."""
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-IN,en;q=0.9",
+    })
+    try:
+        resp = session.get("https://mahabhunakasha.mahabhumi.gov.in/", timeout=15)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        raise RuntimeError(f"Failed to fetch site: {e}") from e
+    print(session.cookies)
+    jsession_cookie_value = session.cookies.get("JSESSIONID")
+    geNPRu9S_cookie_value = session.cookies.get("geNPRu9S")
+    return jsession_cookie_value, geNPRu9S_cookie_value
+
+
 @app.route('/storeCookies')
 def get_cookie():
-    chrome_options = Options()
-    chrome_options.add_argument('--headless')
+    # Use requests instead of Selenium: Vercel has read-only filesystem and no Chrome,
+    # so Selenium/ChromeDriver cannot run. HTTP-based cookie fetch works on serverless.
+    try:
+        jsession_cookie_value, geNPRu9S_cookie_value = _fetch_cookies_via_requests()
+    except RuntimeError as e:
+        return jsonify({"message": str(e), "code": 500}), 500
 
-    # Initialize Chrome WebDriver with the headless option
-    driver = webdriver.Chrome(options=chrome_options)
+    if not jsession_cookie_value and not geNPRu9S_cookie_value:
+        return jsonify({
+            "message": "No JSESSIONID or geNPRu9S cookies received. The site may set them via JavaScript; run /storeCookies on a host with Chrome (e.g. Lambda with chrome layer) or use a remote browser service.",
+            "code": 500,
+        }), 500
 
-    # Open the website
-    driver.get('https://mahabhunakasha.mahabhumi.gov.in/')
-
-    # Get cookies
-    cookies = driver.get_cookies()
-
-    # Close the browser
-    driver.quit()
-
-    jsession_cookie_value = None
-    geNPRu9S_cookie_value = None
-    print(cookies)
-    for cookie in cookies:
-        if cookie['name'] == 'JSESSIONID':
-            jsession_cookie_value = cookie['value']
-
-        elif cookie['name'] == 'geNPRu9S':
-            geNPRu9S_cookie_value = cookie['value']
-
-    # store this cookie in database postgres supabase
     conn, cur = get_db_cursor(DatabaseConfig.get_config())
-    
-    # Delete all existing entries from cookies table
     cur.execute("DELETE FROM cookies")
-    
-    # store it in a json based column name data
     data = {
         "jsession": jsession_cookie_value,
-        "geNPRu9S": geNPRu9S_cookie_value
+        "geNPRu9S": geNPRu9S_cookie_value,
     }
     cur.execute("INSERT INTO cookies (data) VALUES (%s)", (json.dumps(data),))
     conn.commit()
 
-    return {"message": "Cookies stored successfully","code": 200}
+    return jsonify({"message": "Cookies stored successfully", "code": 200})
 
 
 @app.route('/getCookies')
