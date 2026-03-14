@@ -66,7 +66,7 @@ def _fetch_cookies_via_requests():
         resp.raise_for_status()
     except requests.RequestException as e:
         raise RuntimeError(f"Failed to fetch site: {e}") from e
-    print(session.cookies)
+
     jsession_cookie_value = session.cookies.get("JSESSIONID")
     geNPRu9S_cookie_value = session.cookies.get("geNPRu9S")
     return jsession_cookie_value, geNPRu9S_cookie_value
