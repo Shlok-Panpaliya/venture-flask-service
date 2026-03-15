@@ -82,7 +82,7 @@ def get_cookie():
 
     if not jsession_cookie_value and not geNPRu9S_cookie_value:
         return jsonify({
-            "message": "No JSESSIONID or geNPRu9S cookies received. The site may set them via JavaScript; run /storeCookies on a host with Chrome or use a remote browser service.",
+            "message": "No JSESSIONID or bnxpx9vG cookies received. The site may set them via JavaScript; run /storeCookies on a host with Chrome or use a remote browser service.",
             "code": 500,
         }), 500
 
@@ -90,7 +90,7 @@ def get_cookie():
     cur.execute("DELETE FROM cookies")
     data = {
         "jsession": jsession_cookie_value,
-        "geNPRu9S": geNPRu9S_cookie_value,
+        "bnxpx9vG": geNPRu9S_cookie_value,
     }
     cur.execute("INSERT INTO cookies (data) VALUES (%s)", (json.dumps(data),))
     conn.commit()
@@ -279,7 +279,7 @@ def get_plot_report_pdf():
         
         cookies_dict = {
             'ext_name': 'ojplmecpdpgccookcobabopnaifgidhf',
-            'geNPRu9S': cookies['geNPRu9S'],
+            'bnxpx9vG': cookies['bnxpx9vG'],
             'JSESSIONID': cookies['jsession']
         }
         
