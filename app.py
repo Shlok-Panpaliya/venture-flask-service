@@ -1,6 +1,5 @@
 from flask import Flask, json, request, jsonify
 import requests
-from requests.cookies import RequestsCookieJar
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from postgres.client import get_db_cursor
@@ -16,6 +15,7 @@ from flask import request, jsonify
 import re
 import json
 from helpers.api_client import getPlotInfo, getGeoInfo
+from helpers.cookie_service import refresh_cookies_in_database
 from helpers.data_parser import getPlotInfoFromString
 from flask_caching import Cache
 
@@ -53,49 +53,14 @@ def test_database_connection():
         }), 500
 
 
-def _fetch_cookies_via_requests():
-    """Fetch cookies via HTTP only (works on Vercel/serverless; no Chrome needed)."""
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-IN,en;q=0.9",
-    })
-    try:
-        resp = session.get("https://mahabhunakasha.mahabhumi.gov.in/", timeout=15)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        raise RuntimeError(f"Failed to fetch site: {e}") from e
-    # session.cookies is a RequestsCookieJar
-    jsession_cookie_value = session.cookies.get("JSESSIONID")
-    geNPRu9S_cookie_value = session.cookies.get("bnxpx9vG")
-    return jsession_cookie_value, geNPRu9S_cookie_value
-
-
 @app.route('/storeCookies')
 def get_cookie():
-    # Use requests + RequestsCookieJar instead of Selenium (works on Vercel/serverless).
     try:
-        jsession_cookie_value, geNPRu9S_cookie_value = _fetch_cookies_via_requests()
+        data = refresh_cookies_in_database()
     except RuntimeError as e:
         return jsonify({"message": str(e), "code": 500}), 500
 
-    if not jsession_cookie_value and not geNPRu9S_cookie_value:
-        return jsonify({
-            "message": "No JSESSIONID or bnxpx9vG cookies received. The site may set them via JavaScript; run /storeCookies on a host with Chrome or use a remote browser service.",
-            "code": 500,
-        }), 500
-
-    conn, cur = get_db_cursor(DatabaseConfig.get_config())
-    cur.execute("DELETE FROM cookies")
-    data = {
-        "jsession": jsession_cookie_value,
-        "bnxpx9vG": geNPRu9S_cookie_value,
-    }
-    cur.execute("INSERT INTO cookies (data) VALUES (%s)", (json.dumps(data),))
-    conn.commit()
-
-    return jsonify({"message": "Cookies stored successfully", "code": 200})
+    return jsonify({"message": "Cookies stored successfully", "code": 200, "data": data})
 
 
 @app.route('/getCookies')
@@ -158,7 +123,7 @@ def get_survey_numbers():
     # connect to postgres supabase and get the survey numbers from the database
     conn, cur = get_db_cursor(DatabaseConfig.get_config())
     
-# Corrected query using a subquery to handle the aggregation
+    # Corrected query using a subquery to handle the aggregation
     cur.execute("""
         SELECT COALESCE(json_agg(json_build_object(
             'id', subq.id,
@@ -542,14 +507,15 @@ def get_properties_from_api():
         print(f"Fetching plot info for survey: {survey_number}, village: {village_id}")
         
         # Get plot info from external API
-        plotInfo = getPlotInfo(survey_number, village_id, cookies)
+        plotInfo, cookies = getPlotInfo(survey_number, village_id, cookies)
+        print(f"Plot info: {plotInfo}")
 
         if not plotInfo or 'plotid' not in plotInfo:
             return jsonify({"error": "Failed to fetch plot info from external API"}), 500
         
         plotId = plotInfo['plotid']
         
-        # Get geo info
+        # Get geo info (use cookies returned by getPlotInfo in case they were refreshed)
         geoInfo = getGeoInfo(plotId, village_id, cookies)
         
         if not geoInfo:
