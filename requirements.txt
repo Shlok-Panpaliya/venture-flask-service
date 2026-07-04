@@ -8,5 +8,7 @@ python-dotenv
 gunicorn
 Flask-Caching
 Pillow
+ddddocr
+onnxruntime
 pytesseract
 opencv-python-headless
