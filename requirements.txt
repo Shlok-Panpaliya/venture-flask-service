@@ -7,3 +7,6 @@ PyPDF2
 python-dotenv
 gunicorn
 Flask-Caching
+Pillow
+pytesseract
+opencv-python-headless

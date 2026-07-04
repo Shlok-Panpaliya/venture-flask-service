@@ -2,11 +2,16 @@ from flask import Flask, json, request, jsonify
 import requests
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait, Select
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import NoSuchElementException
 from postgres.client import get_db_cursor
 from config import DatabaseConfig
 from flask_cors import CORS
 import ast  # for literal_eval
 import time  # for sleep functionality
+import unicodedata
 from PyPDF2 import PdfReader, PdfWriter
 import io
 import base64
@@ -14,9 +19,15 @@ import requests
 from flask import request, jsonify
 import re
 import json
+import random
 from helpers.api_client import getPlotInfo, getGeoInfo
 from helpers.cookie_service import refresh_cookies_in_database
 from helpers.data_parser import getPlotInfoFromString
+from helpers.bhulekh_captcha import (
+    captcha_png_bytes_from_data_src,
+    ocr_bhulekh_captcha_for_driver,
+    ocr_bhulekh_captcha_png,
+)
 from flask_caching import Cache
 
 app = Flask(__name__)
@@ -338,137 +349,402 @@ def get_tdr_certificates():
         "count": len(sample_tdr_certificates)
     })
 
-@app.route('/get712PDF')
-@cache.cached(timeout=24 * 60 * 60, query_string=True)
-def get_7_12_pdf():
+def _wait_aspnet_postback(driver, wait, seconds=2.5):
+    """Bhulekh triggers __doPostBack on dropdown change; brief wait for partial/full postback."""
+    time.sleep(seconds)
     try:
-        # Get parameters from request
-        district = request.args.get('district', 'पुणे')  # Default to Pune
-        taluka = request.args.get('taluka')
-        village = request.args.get('village')
-        survey_number = request.args.get('survey_number')
-        mobile = request.args.get('mobile', '9876543210')  # Default dummy mobile
-        
-        if not all([taluka, village, survey_number]):
-            return jsonify({"error": "taluka, village, and survey_number are required"}), 400
+        wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+    except Exception:
+        pass
 
-        # Setup Chrome driver
+
+def _scroll_into_view(driver, element, block="center"):
+    driver.execute_script(
+        "arguments[0].scrollIntoView({block: arguments[1], inline: 'nearest'});",
+        element,
+        block,
+    )
+
+
+def _safe_click(driver, element):
+    """
+    Bhulekh often shows footers, accessibility widgets, or modals over lower buttons;
+    native click then fails with 'element click intercepted'. Scroll + JS click fallback.
+    """
+    _scroll_into_view(driver, element, "center")
+    time.sleep(0.35)
+    try:
+        element.click()
+    except Exception:
+        driver.execute_script("arguments[0].click();", element)
+
+
+def _normalize_captcha(s):
+    if not s:
+        return ""
+    return re.sub(r"[^A-Za-z0-9]", "", str(s).strip())[:6]
+
+
+def _wait_captcha_data_url(driver, timeout=25):
+    def ready(d):
+        src = d.find_element(By.ID, "ContentPlaceHolder1_captchaImage").get_attribute("src") or ""
+        return src.startswith("data:image") and "," in src and len(src) > 80
+
+    WebDriverWait(driver, timeout).until(ready)
+
+
+def _refresh_bhulekh_captcha(driver):
+    img = driver.find_element(By.ID, "ContentPlaceHolder1_captchaImage")
+    old_src = img.get_attribute("src") or ""
+    ref_btn = driver.find_element(By.ID, "ContentPlaceHolder1_btnreferesh")
+    _safe_click(driver, ref_btn)
+
+    def src_changed(d):
+        n = d.find_element(By.ID, "ContentPlaceHolder1_captchaImage").get_attribute("src") or ""
+        return n != old_src and n.startswith("data:image")
+
+    WebDriverWait(driver, 15).until(src_changed)
+    time.sleep(0.3)
+
+
+_zw_chars = re.compile(r"[\u200b\u200c\u200d\ufeff]")
+
+
+def _norm_bhulekh_label(s):
+    if s is None:
+        return ""
+    t = _zw_chars.sub("", str(s)).strip()
+    return unicodedata.normalize("NFC", t)
+
+
+def _survey_part1_for_bhulekh(survey_raw):
+    """
+    Bhulekh सर्वे नंबर(भाग-1) expects the first numeric segment only, e.g. 113/3/1 -> 113.
+    """
+    if survey_raw is None:
+        return ""
+    s = str(survey_raw).strip()
+    if not s:
+        return ""
+    first = s.split("/")[0].strip()
+    return first[:10] if first else ""
+
+
+def _random_mobile_94():
+    """10-digit Indian-style mobile: 94 + 8 random digits."""
+    return "94" + "".join(str(random.randint(0, 9)) for _ in range(8))
+
+
+def _wait_ddlsurveyno_populated(driver, wait, timeout=30):
+    """After शोधा, सर्वे नंबर dropdown must list real options (not only --निवडा--)."""
+
+    def has_survey_options(d):
+        el = d.find_element(By.ID, "ContentPlaceHolder1_ddlsurveyno")
+        for opt in Select(el).options:
+            v = opt.get_attribute("value") or ""
+            if v and v != "--निवडा--":
+                return True
+        return False
+
+    WebDriverWait(driver, timeout).until(has_survey_options)
+
+
+def _select_ddlsurveyno_exact(select_el, survey_raw):
+    """
+    Pick ContentPlaceHolder1_ddlsurveyno option matching API survey_number (e.g. 113/3/1).
+    Option value and visible text match; Unicode/ZW normalized if needed.
+    """
+    raw = str(survey_raw).strip() if survey_raw else ""
+    if not raw:
+        raise ValueError("survey_number is empty")
+    target_norm = _norm_bhulekh_label(raw)
+    sel = Select(select_el)
+    for attempt in (raw, target_norm):
+        try:
+            sel.select_by_value(attempt)
+            return attempt
+        except Exception:
+            continue
+    for opt in sel.options:
+        v = opt.get_attribute("value") or ""
+        if not v or v == "--निवडा--":
+            continue
+        if _norm_bhulekh_label(v) == target_norm:
+            sel.select_by_value(v)
+            return v
+    preview = [
+        opt.get_attribute("value")
+        for opt in sel.options[:40]
+        if opt.get_attribute("value") not in (None, "", "--निवडा--")
+    ]
+    raise NoSuchElementException(
+        f"सर्वे नंबर: no <option> matched {raw!r} (normalized={target_norm!r}). "
+        f"Sample values: {preview!r}"
+    )
+
+
+def _select_bhulekh_dropdown(select_el, *, value=None, label=None, field_name="dropdown"):
+    """
+    select_by_visible_text often fails on Devanagari due to NFC/NFD or copy-paste variants.
+    Prefer *_id + select_by_value; otherwise match option text after NFC normalize.
+    """
+    sel = Select(select_el)
+    if value is not None and str(value).strip() != "":
+        sel.select_by_value(str(value))
+        return
+    if not label or not str(label).strip():
+        raise ValueError(f"{field_name}: pass value or non-empty label")
+    target = _norm_bhulekh_label(label)
+    try:
+        sel.select_by_visible_text(label.strip())
+        return
+    except Exception:
+        pass
+    for opt in sel.options:
+        t = opt.text
+        if t and _norm_bhulekh_label(t) == target:
+            sel.select_by_value(opt.get_attribute("value"))
+            return
+    substr_matches = [
+        opt for opt in sel.options
+        if opt.text
+        and (
+            target == _norm_bhulekh_label(opt.text)
+            or target in _norm_bhulekh_label(opt.text)
+            or _norm_bhulekh_label(opt.text) in target
+        )
+    ]
+    if len(substr_matches) == 1:
+        sel.select_by_value(substr_matches[0].get_attribute("value"))
+        return
+    preview = [opt.text for opt in sel.options[:20] if opt.text]
+    raise NoSuchElementException(
+        f"{field_name}: no option matched label {label!r} (normalized={target!r}). "
+        f"Use {field_name}_id from the <option value=\"…\"> instead. Sample options: {preview!r}"
+    )
+
+
+@app.route('/get712PDF')
+def get_7_12_pdf():
+    """
+    Fill 7/12 form on https://bhulekh.mahabhumi.gov.in/ through district → taluka → village
+    through सर्वे नंबर dropdown, random 94xxxxxxxx mobile, OCR captcha (Tesseract), and Submit.
+    Optional: ?captcha_manual=Ab12cd to skip OCR (max 6 alphanumeric).
+
+    Sample query (values from live markup — Amravati / Akoli Part 1):
+      /get712PDF?district_id=7&taluka_id=9&village_id=270700090077070000&survey_number=113/3/1
+      (भाग-1 = 113, Search, then selects ddlsurveyno value matching 113/3/1 if present)
+
+    Or by visible labels:
+      /get712PDF?district=अमरावती&taluka=अमरावती&village=अकोली भाग 1&survey_number=113/3/1
+
+    This route is not cached (Selenium must run on every request).
+    For local debugging, append e.g. &debug_keep_browser_seconds=15 to keep the window
+    open before it closes (HTTP response is delayed until the wait finishes).
+    """
+    try:
+        district = request.args.get('district')
+        district_id = request.args.get('district_id')
+        taluka = request.args.get('taluka')
+        taluka_id = request.args.get('taluka_id')
+        village = request.args.get('village')
+        village_id = request.args.get('village_id')
+        survey_number = request.args.get('survey_number')
+        captcha_manual = request.args.get('captcha_manual')
+        debug_keep_browser_seconds = request.args.get('debug_keep_browser_seconds', type=int)
+
+        if not survey_number:
+            return jsonify({"error": "survey_number is required"}), 400
+        if not district and not district_id:
+            return jsonify({"error": "district or district_id is required"}), 400
+        if not taluka and not taluka_id:
+            return jsonify({"error": "taluka or taluka_id is required"}), 400
+        if not village and not village_id:
+            return jsonify({"error": "village or village_id is required"}), 400
+
         chrome_options = Options()
-       # chrome_options.add_argument('--headless')
+        # chrome_options.add_argument('--headless')
         chrome_options.add_argument('--no-sandbox')
         chrome_options.add_argument('--disable-dev-shm-usage')
         chrome_options.add_argument('--disable-gpu')
         chrome_options.add_argument('--window-size=1920,1080')
-        
-        driver = webdriver.Chrome(options=chrome_options)
-        
-        try:
-            # Navigate to the website
-            driver.get('https://bhulekh.mahabhumi.gov.in/')
-            
-            # Wait for page to load
-            driver.implicitly_wait(10)
-            
-            # Select 7/12 option
-            # seven_twelve_radio = driver.find_element("xpath", "//input[@value='7/12']")
-            # seven_twelve_radio.click()
-            
-            # Select district
-            district_dropdown = driver.find_element("id", "ContentPlaceHolder1_ddlMainDist")
-            district_dropdown.click()
 
-            district_option = district_dropdown.select_by_visible_text("अमरावती")
-            district_option.click()
-            
-            # Wait for taluka dropdown to populate
-            import time
-            time.sleep(2)
-            
-            # Select taluka
-            taluka_dropdown = driver.find_element("name", "taluka")
-            taluka_dropdown.click()
-            taluka_option = driver.find_element("xpath", f"//option[contains(text(), '{taluka}')]")
-            taluka_option.click()
-            
-            # Wait for village dropdown to populate
-            time.sleep(2)
-            
-            # Select village
-            village_dropdown = driver.find_element("name", "village")
-            village_dropdown.click()
-            village_option = driver.find_element("xpath", f"//option[contains(text(), '{village}')]")
-            village_option.click()
-            
-            # Select survey number option (assuming "सर्वे नंबर" - Survey Number)
-            survey_radio = driver.find_element("xpath", "//input[@value='survey']")
-            survey_radio.click()
-            
-            # Enter survey number
-            survey_input = driver.find_element("name", "survey_number")
-            survey_input.clear()
-            survey_input.send_keys(survey_number)
-            
-            # Enter mobile number
-            mobile_input = driver.find_element("name", "mobile")
-            mobile_input.clear()
-            mobile_input.send_keys(mobile)
-            
-            # Select language (default to Marathi)
-            language_dropdown = driver.find_element("name", "language")
-            language_dropdown.click()
-            marathi_option = driver.find_element("xpath", "//option[@value='Marathi']")
-            marathi_option.click()
-            
-            # Handle captcha - for now, we'll try to detect and solve simple captchas
-            captcha_img = driver.find_element("xpath", "//img[contains(@src, 'captcha')]")
-            captcha_input = driver.find_element("name", "captcha")
-            
-            # Simple captcha detection (this is a basic implementation)
-            # In a real scenario, you might need more sophisticated captcha solving
-            captcha_text = "12345"  # Placeholder - would need actual captcha solving
-            captcha_input.clear()
-            captcha_input.send_keys(captcha_text)
-            
-            # Submit the form
-            submit_button = driver.find_element("xpath", "//input[@type='submit']")
-            submit_button.click()
-            
-            # Wait for results
-            time.sleep(5)
-            
-            # Check if we got results or need to handle errors
-            current_url = driver.current_url
-            page_source = driver.page_source
-            
-            # Look for download link or PDF content
-            pdf_links = driver.find_elements("xpath", "//a[contains(@href, '.pdf')]")
-            
-            if pdf_links:
-                pdf_url = pdf_links[0].get_attribute('href')
-                return jsonify({
-                    "success": True,
-                    "pdf_url": pdf_url,
-                    "message": "7/12 record found successfully"
-                })
-            else:
-                # Check for error messages
-                error_elements = driver.find_elements("xpath", "//*[contains(text(), 'Error') or contains(text(), 'त्रुटी')]")
-                if error_elements:
-                    error_message = error_elements[0].text
-                    return jsonify({
-                        "success": False,
-                        "error": f"Website error: {error_message}"
-                    }), 400
+        driver = webdriver.Chrome(options=chrome_options)
+        wait = WebDriverWait(driver, 30)
+
+        try:
+            driver.get('https://bhulekh.mahabhumi.gov.in/')
+            wait.until(EC.presence_of_element_located((By.ID, 'ContentPlaceHolder1_ddlMainDist')))
+
+            # District — id ContentPlaceHolder1_ddlMainDist
+            dist_el = wait.until(EC.presence_of_element_located((By.ID, 'ContentPlaceHolder1_ddlMainDist')))
+            _scroll_into_view(driver, dist_el, "center")
+            _select_bhulekh_dropdown(
+                dist_el, value=district_id, label=district, field_name="district",
+            )
+            _wait_aspnet_postback(driver, wait)
+
+            # Taluka — id ContentPlaceHolder1_ddlTalForAll
+            tal_el = wait.until(EC.presence_of_element_located((By.ID, 'ContentPlaceHolder1_ddlTalForAll')))
+            _scroll_into_view(driver, tal_el, "center")
+            _select_bhulekh_dropdown(
+                tal_el, value=taluka_id, label=taluka, field_name="taluka",
+            )
+            _wait_aspnet_postback(driver, wait)
+
+            # Village — id ContentPlaceHolder1_ddlVillForAll (prefer village_id)
+            vill_el = wait.until(EC.presence_of_element_located((By.ID, 'ContentPlaceHolder1_ddlVillForAll')))
+            _scroll_into_view(driver, vill_el, "center")
+            _select_bhulekh_dropdown(
+                vill_el, value=village_id, label=village, field_name="village",
+            )
+            _wait_aspnet_postback(driver, wait)
+
+            # Survey/Gat mode: default on page is सर्वे नंबर (value 17 + ddl  सर्वे नंबर) — no click needed for first phase.
+
+            # सर्वे नंबर(भाग-1): first segment only (e.g. 113/3/1 -> 113) — ContentPlaceHolder1_txtcsno
+            survey_part1 = _survey_part1_for_bhulekh(survey_number)
+            if not survey_part1:
+                return jsonify({"error": "survey_number must contain a non-empty first part (e.g. 113 or 113/3/1)"}), 400
+
+            part1 = wait.until(EC.presence_of_element_located((By.ID, 'ContentPlaceHolder1_txtcsno')))
+            _scroll_into_view(driver, part1, "center")
+            part1.clear()
+            part1.send_keys(survey_part1)
+
+            search_btn = wait.until(EC.presence_of_element_located((By.ID, 'ContentPlaceHolder1_btnsearchfind')))
+            _safe_click(driver, search_btn)
+            _wait_aspnet_postback(driver, wait)
+
+            _wait_ddlsurveyno_populated(driver, wait)
+            survey_dd = wait.until(EC.presence_of_element_located((By.ID, 'ContentPlaceHolder1_ddlsurveyno')))
+            _scroll_into_view(driver, survey_dd, "center")
+            survey_option_value = _select_ddlsurveyno_exact(survey_dd, survey_number)
+            _wait_aspnet_postback(driver, wait)
+
+            mobile = _random_mobile_94()
+            mobile_el = wait.until(EC.presence_of_element_located((By.ID, 'ContentPlaceHolder1_txtmobile1')))
+            _scroll_into_view(driver, mobile_el, "center")
+            mobile_el.clear()
+            mobile_el.send_keys(mobile)
+            time.sleep(0.6)
+
+            max_captcha_attempts = 1 if captcha_manual else 5
+            pdf_urls = []
+            last_captcha_used = ""
+            attempts_made = 0
+            ocr_config_error = None
+
+            for attempt in range(1, max_captcha_attempts + 1):
+                attempts_made = attempt
+                _wait_captcha_data_url(driver)
+
+                if captcha_manual:
+                    cap = _normalize_captcha(captcha_manual)
+                    if not cap:
+                        return jsonify({
+                            "error": "captcha_manual must contain at least one letter/digit (max 6).",
+                        }), 400
                 else:
-                    return jsonify({
-                        "success": False,
-                        "message": "No PDF found, but form submitted successfully",
-                        "current_url": current_url
-                    })
-            
+                    img_el = driver.find_element(
+                        By.ID, "ContentPlaceHolder1_captchaImage"
+                    )
+                    _scroll_into_view(driver, img_el, "center")
+                    time.sleep(0.25)
+                    try:
+                        cap = ocr_bhulekh_captcha_for_driver(img_el)
+                    except RuntimeError as err:
+                        try:
+                            src = img_el.get_attribute("src")
+                            if src and str(src).startswith("data:"):
+                                png = captcha_png_bytes_from_data_src(src)
+                                cap = ocr_bhulekh_captcha_png(png)
+                            else:
+                                ocr_config_error = str(err)
+                                break
+                        except Exception:
+                            ocr_config_error = str(err)
+                            break
+
+                last_captcha_used = cap
+                if not cap:
+                    if attempt < max_captcha_attempts:
+                        _refresh_bhulekh_captcha(driver)
+                        continue
+                    break
+
+                captcha_el = wait.until(
+                    EC.presence_of_element_located((By.ID, "ContentPlaceHolder1_txtcaptcha"))
+                )
+                _scroll_into_view(driver, captcha_el, "center")
+                captcha_el.clear()
+                captcha_el.send_keys(cap)
+
+                submit_btn = wait.until(
+                    EC.presence_of_element_located((By.ID, "ContentPlaceHolder1_btnmainsubmit"))
+                )
+                _safe_click(driver, submit_btn)
+                time.sleep(25)
+                _wait_aspnet_postback(driver, wait, seconds=1.5)
+
+                anchors = driver.find_elements(By.XPATH, "//a[contains(@href, '.pdf')]")
+                pdf_urls = [
+                    h for h in (a.get_attribute("href") for a in anchors) if h
+                ]
+                if pdf_urls:
+                    break
+
+                if attempt < max_captcha_attempts and not captcha_manual:
+                    try:
+                        _refresh_bhulekh_captcha(driver)
+                    except Exception:
+                        pass
+
+            current_url = driver.current_url
+
+            if ocr_config_error:
+                return jsonify({
+                    "error": ocr_config_error,
+                    "hint": "Install Tesseract OCR and pip install pytesseract Pillow, or pass captcha_manual=… for tests.",
+                }), 503
+
+            return jsonify({
+                "success": bool(pdf_urls),
+                "step": "submitted_with_pdf" if pdf_urls else "submitted_pdf_not_detected",
+                "message": (
+                    "Form submitted; PDF link(s) found."
+                    if pdf_urls
+                    else (
+                        "Form submitted but no .pdf link found (wrong captcha / validation / page changed). "
+                        "Try captcha_manual or increase OCR quality; check current_url."
+                    )
+                ),
+                "current_url": current_url,
+                "pdf_urls": pdf_urls,
+                "captcha_attempts": attempts_made,
+                "captcha_manual_used": bool(captcha_manual),
+                "last_captcha_used": last_captcha_used,
+                "inputs_used": {
+                    "district": district,
+                    "district_id": district_id,
+                    "taluka": taluka,
+                    "taluka_id": taluka_id,
+                    "village": village,
+                    "village_id": village_id,
+                    "survey_number": survey_number,
+                    "survey_number_part1_filled": survey_part1,
+                    "survey_ddlsurveyno_value": survey_option_value,
+                    "mobile_filled": mobile,
+                },
+            })
+
         finally:
+            if debug_keep_browser_seconds and debug_keep_browser_seconds > 0:
+                time.sleep(min(debug_keep_browser_seconds, 120))
+            # added for testing purpsose, dont remove
+            time.sleep(10)
             driver.quit()
-            
+
     except Exception as e:
         return jsonify({"error": f"Server error: {str(e)}"}), 500
 
@@ -480,7 +756,7 @@ def get_properties_from_api():
     """Get properties directly from external API without database"""
     try:
         survey_number_id = request.args.get('survey_number_id')
-        
+        print(f"Survey number id: {survey_number_id}")
         if not survey_number_id:
             return jsonify({"error": "survey_number_id is required"}), 400
         
@@ -501,7 +777,7 @@ def get_properties_from_api():
         cookie_data = cur.fetchone()
         if not cookie_data:
             return jsonify({"error": "No cookies found in database"}), 404
-
+        print(f"Cookie data: {cookie_data}")
         cookies = cookie_data[0]
         
         print(f"Fetching plot info for survey: {survey_number}, village: {village_id}")
@@ -516,7 +792,7 @@ def get_properties_from_api():
         plotId = plotInfo['plotid']
         
         # Get geo info (use cookies returned by getPlotInfo in case they were refreshed)
-        geoInfo = getGeoInfo(plotId, village_id, cookies)
+        geoInfo, _ = getGeoInfo(plotId, village_id, cookies)
         
         if not geoInfo:
             return jsonify({"error": "Failed to fetch geo info from external API"}), 500
