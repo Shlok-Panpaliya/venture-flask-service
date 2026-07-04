@@ -35,8 +35,13 @@ synthetic** captchas (the font was identified by direct glyph comparison; see
 `synth_captcha.py`) mixed with the 1500 real labels. Two targeted augmentations closed most of
 the gap: biasing synthetic strings toward adjacent-duplicate pairs (so CTC learns to separate
 `mm`→`m`) and toward confusable glyphs (`g/q`, `v/y`), plus keeping the native 40px height so
-glyph descenders survive. The 5 residual gold misses are `g/q`/`v/y` look-alikes and one
-likely mislabel in the gold set (true accuracy is probably ~92%).
+glyph descenders survive.
+
+**Held-out validation** — on 200 freshly harvested captchas (never trained on), labeled by
+eye: **92.5% strict exact** (185/200), **94.5%** if you fold the `l`/`I` glyph that renders
+identically in this font (unrecoverable from pixels), and **100% over the 5-retry loop**, at
+~6ms/image. The dominant residual error is `g/q` (6 of 11 real misses); everything else is a
+scatter of singletons. See `eval_holdout200.py`.
 
 ## Pipeline scripts
 
