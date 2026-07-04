@@ -1,72 +1,65 @@
-# Captcha OCR verification harness
+# Captcha OCR — harness, training, and verification
 
-Measures how well `helpers/bhulekh_captcha.ocr_bhulekh_captcha_png` reads **live**
-Bhulekh captchas. It harvests real captcha images from the site by clicking the
-refresh button in a headless browser, runs them through the project OCR pipeline,
-and produces an HTML table comparing OCR output against a human reading.
+Tools for reading **live** Bhulekh captchas in `helpers/bhulekh_captcha.ocr_bhulekh_captcha_png`.
+Covers harvesting, labeling, training the custom CNN, and measuring accuracy against a
+human-read gold set.
 
-## OCR engine
+## Production OCR engine (3-tier, best-first)
 
-`ocr_bhulekh_captcha_png` uses **ddddocr** (a captcha-specialized CRNN, CPU/ONNX,
-~6 ms/image) as the primary engine, then a **glyph-height case-correction** pass
-recovers letter case for the case-sensitive form field (ddddocr tends to lowercase;
-for size-only-ambiguous letters `c/C o/O s/S u/U v/V w/W x/X z/Z` we compare each
-glyph's height to the tallest glyph). The old multi-variant **Tesseract voting**
-pipeline remains as a fallback if ddddocr isn't installed.
+`ocr_bhulekh_captcha_png` tries, in order:
 
-Measured accuracy (case-sensitive exact match, Claude-vision ground truth):
+1. **Per-character CNN** (`helpers/models/captcha_char_cnn.onnx`, ONNX/CPU, ~ms) — trained on
+   this exact captcha font. Cleans the image (denoise + inpaint the strike line), segments it
+   into 6 glyphs, and classifies each. Used when the image segments into exactly 6 glyphs.
+2. **ddddocr + glyph-height case-correction** — a captcha-specialized CRNN; covers frames the
+   CNN can't segment, and works even if the CNN model / onnxruntime isn't installed.
+3. **Tesseract multi-variant voting** — final fallback.
 
-| Batch | Exact per-captcha | 5-retry eventual |
-|-------|-------------------|------------------|
-| 20 captchas | 70% | 99.8% |
-| 50 captchas | 52% (95% CI 39–65%) | 97.5% (CI 91–99.5%) |
+Case matters (the Bhulekh field is case-sensitive); every tier preserves letter case.
 
-The app retries up to 5 times with a fresh captcha each attempt, so the per-captcha
-rate compounds well past the 90% end-to-end target. Residual misses are the
-unresolvable `l/I`, `O/0` glyph ambiguities and ascender-letter case (`f/F`, `k/K`)
-that glyph height can't distinguish — a font-trained CNN would be the lever to push
-per-captcha higher, but end-to-end already clears 90%.
+### Measured accuracy (case-sensitive exact match, Claude-vision gold truth)
 
-## Pipeline
+| Engine | Gold-50 exact | 5-retry end-to-end |
+|--------|---------------|--------------------|
+| Tesseract only (original) | 0% | ~0% |
+| ddddocr + case-correction | 52% | 97.5% |
+| CNN (240 labels) + ddddocr fallback | 64% | 99.4% |
+| **CNN (1500 labels) + ddddocr fallback** | **68%** | **99.7%** |
 
-1. **`scrape_captchas.mjs`** — Puppeteer loads
-   `https://bhulekh.mahabhumi.gov.in/NewBhulekh.aspx`, reads the
-   `#ContentPlaceHolder1_captchaImage` data URL, saves a PNG, clicks
-   `#ContentPlaceHolder1_btnreferesh`, waits for a new image, repeats.
-   → `captchas/cap_NN.png` + `captchas/manifest.json`
-2. **`run_ocr.py`** — feeds each PNG through `ocr_bhulekh_captcha_png`.
-   → `captchas/results.json`
-3. **`generate_report.py`** — joins images + OCR + the `MY_READING` ground-truth
-   dict into `captcha_report.html` (accuracy tiles, per-char diff, manual-pass column).
+The app retries up to 5× with a fresh captcha each attempt, so per-captcha accuracy compounds
+well past the 90% end-to-end target. Remaining misses are the unresolvable `l/I` and `O/0`
+glyph ambiguities (present even in human labels) and the ~18% of captchas that don't segment
+cleanly into 6 glyphs (handled by the ddddocr fallback).
+
+## Pipeline scripts
+
+| Script | Purpose |
+|--------|---------|
+| `scrape_parallel.mjs` | Harvest captchas fast — N isolated Puppeteer browser contexts (independent ASP.NET sessions), content-dedup. `node scrape_parallel.mjs 1500 ./dataset 6` |
+| `scrape_captchas.mjs` | Single-session serial scraper (kept for small/simple runs). |
+| `make_sheets.py` | Tile dataset captchas into indexed contact sheets for fast human labeling. |
+| `label_captchas.py` | Alternative: auto-label with a Claude vision model (needs `ANTHROPIC_API_KEY`). |
+| `train_char_cnn.py` | Train the per-character CNN; reports gold accuracy; exports ONNX. |
+| `self_train.py` | Optional: expand labels via high-confidence pseudo-labels (plateaued here — genuine labels help more). |
+| `run_ocr.py` / `generate_report.py` / `validate.py` | Run the pipeline over images and score / build an HTML report. |
+| `labels.json` | The 1500 human (Claude-vision) labels used to train the shipped model. Raw dataset images are re-harvestable and kept out of the repo. |
+
+## Retrain from scratch
+
+```bash
+# 1. harvest (parallel, fast)
+node scrape_parallel.mjs 1500 ./dataset 6
+# 2. label — either contact sheets (python make_sheets.py) read by a human,
+#    or auto-label:  PYTHONPATH=.. python label_captchas.py --dir dataset --out dataset/labels.json
+# 3. train the per-char CNN + export ONNX
+PYTHONPATH=.. python train_char_cnn.py --dir dataset --labels dataset/labels.json \
+    --gold-dir captchas50 --gold-truth truth50.json --epochs 50 --out char_cnn
+# 4. drop char_cnn.onnx into helpers/models/captcha_char_cnn.onnx
+```
 
 ## Requirements
 
-- **Node** ≥ 18 and `puppeteer` (`npm i puppeteer` — downloads its own Chrome).
-- **Tesseract** system binary (`brew install tesseract`).
-- **Python** deps: `numpy Pillow pytesseract opencv-python-headless`
-  (opencv is optional; the pipeline falls back to PIL without it).
-
-## Run
-
-```bash
-# 1. harvest N live captchas (headless browser)
-node scrape_captchas.mjs 20 ./captchas
-
-# 2. OCR them with the project pipeline (PYTHONPATH must reach the repo root)
-PYTHONPATH=.. python run_ocr.py ./captchas
-
-# 3. fill in MY_READING in generate_report.py by eyeballing each cap_NN.png,
-#    then build the report
-python generate_report.py ./captchas ./captcha_report.html
-open captcha_report.html
-```
-
-## Notes
-
-- `MY_READING` in `generate_report.py` is the human ground truth. Update it for a
-  fresh batch (captchas are random each run). Without it, the "match" column is
-  meaningless.
-- These captchas use wavy strike-through distortion lines, which Tesseract handles
-  poorly — expect low exact-match accuracy. Use the report to decide whether the
-  OCR path is viable or whether `?captcha_manual=` / a dedicated captcha model /
-  a solving service is needed.
+- **Runtime (service):** `onnxruntime` (CNN), `ddddocr` (fallback), `opencv-python-headless`,
+  `Pillow`, `numpy`; `pytesseract` + Tesseract for the last-resort fallback. All in
+  `requirements.txt`.
+- **Training only:** `torch`, and Node ≥18 + `puppeteer` for harvesting.

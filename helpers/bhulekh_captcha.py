@@ -22,6 +22,7 @@ import base64
 import io
 import os
 import re
+import string
 import tempfile
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
@@ -32,6 +33,11 @@ try:
     import cv2
 except ImportError:  # pragma: no cover
     cv2 = None
+
+try:
+    import onnxruntime as ort
+except ImportError:  # pragma: no cover
+    ort = None
 
 from PIL import Image, ImageEnhance, ImageFilter
 
@@ -561,15 +567,83 @@ def _ocr_tesseract_vote(png_bytes: bytes) -> str:
         raise
 
 
+# ---------------------------------------------------------------------------
+# Best engine: a small per-character CNN trained on this exact captcha font
+# ---------------------------------------------------------------------------
+
+# Class order MUST match training (train_char_cnn.py): digits, uppercase, lowercase.
+_CNN_CHARS = string.digits + string.ascii_uppercase + string.ascii_lowercase
+_CNN_PATH = os.path.join(os.path.dirname(__file__), "models", "captcha_char_cnn.onnx")
+_CNN_S = 32  # crop side, must match training
+_CNN_SESSION = None
+_CNN_UNAVAILABLE = False
+
+
+def _get_cnn_session():
+    """Lazily load the ONNX char classifier once; None if onnxruntime/model unavailable."""
+    global _CNN_SESSION, _CNN_UNAVAILABLE
+    if _CNN_SESSION is not None or _CNN_UNAVAILABLE:
+        return _CNN_SESSION
+    if ort is None or not os.path.isfile(_CNN_PATH):
+        _CNN_UNAVAILABLE = True
+        return None
+    try:
+        _CNN_SESSION = ort.InferenceSession(_CNN_PATH, providers=["CPUExecutionProvider"])
+    except Exception:
+        _CNN_UNAVAILABLE = True
+    return _CNN_SESSION
+
+
+def _norm_crop(bw: np.ndarray, box: List[int]) -> np.ndarray:
+    """Center a glyph crop on a 32x32 canvas at ~24px — identical to training preprocessing."""
+    x, y, w, h = box
+    crop = bw[y:y + h, x:x + w]
+    scale = 24.0 / max(w, h)
+    nw, nh = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+    im = Image.fromarray(crop).resize((nw, nh), Image.LANCZOS)
+    canvas = np.zeros((_CNN_S, _CNN_S), np.float32)
+    ox, oy = (_CNN_S - nw) // 2, (_CNN_S - nh) // 2
+    canvas[oy:oy + nh, ox:ox + nw] = np.asarray(im, np.float32) / 255.0
+    return canvas
+
+
+def _cnn_read(png_bytes: bytes) -> Optional[str]:
+    """
+    Clean + segment the captcha into 6 glyphs and classify each with the trained CNN.
+    Returns the 6-char string, or None if the model is unavailable or the image doesn't
+    segment into exactly 6 glyphs (caller then falls back to ddddocr).
+    """
+    sess = _get_cnn_session()
+    if sess is None:
+        return None
+    try:
+        bw = _clean_binary(png_bytes)
+        if bw is None:
+            return None
+        boxes = _char_boxes(bw)
+        if len(boxes) != 6:
+            return None
+        batch = np.stack([_norm_crop(bw, b) for b in boxes])[:, None]  # (6,1,32,32)
+        logits = sess.run(["logits"], {"c": batch.astype(np.float32)})[0]
+        return "".join(_CNN_CHARS[i] for i in logits.argmax(1))
+    except Exception:
+        return None
+
+
 def ocr_bhulekh_captcha_png(png_bytes: bytes) -> str:
     """
-    Read a Bhulekh captcha.
+    Read a Bhulekh captcha (case-sensitive), best engine first:
 
-    Primary path: ddddocr (a captcha-specialized CRNN — CPU/ONNX, ~ms per image) reads the raw
-    image, then a glyph-height pass recovers letter case for the case-sensitive form field.
-    Falls back to the multi-variant Tesseract voting pipeline if ddddocr isn't installed or
-    returns nothing usable.
+    1. A per-character CNN trained on this exact captcha font (ONNX, CPU) — used when the
+       cleaned image segments into exactly 6 glyphs.
+    2. ddddocr (captcha-specialized CRNN) + glyph-height case-correction — covers frames the
+       CNN can't segment, and when the CNN model/onnxruntime isn't installed.
+    3. Multi-variant Tesseract voting — final fallback when neither model is available.
     """
+    cnn = _cnn_read(png_bytes)
+    if cnn:
+        return cnn
+
     guess = _ddddocr_read(png_bytes)
     if guess and len(guess) >= 3:
         return _correct_case(guess, png_bytes)
