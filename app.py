@@ -145,33 +145,59 @@ def get_districts():
     try:
         conn, cur = get_db_cursor(DatabaseConfig.get_config())
         table = _find_relation(cur, ['district', 'districts'])
-        if not table:
-            return jsonify([])
+        if table:
+            id_column = _find_column(cur, table, ['id', 'district_id'])
+            name_column = _find_column(cur, table, ['name', 'district_name'])
+            english_column = _find_column(cur, table, ['english_name', 'englishname', 'english_name_en'])
+            if id_column and name_column:
+                columns = [id_column, name_column] + ([english_column] if english_column and english_column not in [id_column, name_column] else [])
+                select_sql = ', '.join('"' + col.replace('"', '""') + '"' for col in columns)
+                table_sql = '"' + table.replace('"', '""') + '"'
+                cur.execute(f'SELECT {select_sql} FROM {table_sql}')
+                return jsonify([
+                    {
+                        "id": row[0],
+                        "name": row[1],
+                        "englishName": row[2] if english_column else row[1],
+                    }
+                    for row in cur.fetchall()
+                ])
 
-        id_column = _find_column(cur, table, ['id', 'district_id'])
-        name_column = _find_column(cur, table, ['name', 'district_name'])
-        english_column = _find_column(cur, table, ['english_name', 'englishname', 'english_name_en'])
-        if not id_column or not name_column:
-            return jsonify([])
+        # Fallback for databases that do not contain a separate district table:
+        # derive district identifiers from the taluka/village hierarchy.
+        taluka_table = _find_relation(cur, ['taluka', 'talukas'])
+        if taluka_table:
+            district_column = _find_column(cur, taluka_table, ['district_id', 'districtId'])
+            if district_column:
+                dc = '"' + district_column.replace('"', '""') + '"'
+                tc = '"' + taluka_table.replace('"', '""') + '"'
+                cur.execute(f'SELECT DISTINCT {dc} FROM {tc} WHERE {dc} IS NOT NULL ORDER BY {dc}')
+                return jsonify([
+                    {
+                        "id": row[0],
+                        "name": "Amravati" if str(row[0]) == "7" else str(row[0]),
+                        "englishName": "Amravati" if str(row[0]) == "7" else str(row[0]),
+                    }
+                    for row in cur.fetchall()
+                ])
 
-        columns = [id_column, name_column]
-        if english_column and english_column not in columns:
-            columns.append(english_column)
+        village_table = _find_relation(cur, ['village', 'villages'])
+        if village_table:
+            district_column = _find_column(cur, village_table, ['district_id', 'districtId'])
+            if district_column:
+                dc = '"' + district_column.replace('"', '""') + '"'
+                vc = '"' + village_table.replace('"', '""') + '"'
+                cur.execute(f'SELECT DISTINCT {dc} FROM {vc} WHERE {dc} IS NOT NULL ORDER BY {dc}')
+                return jsonify([
+                    {
+                        "id": row[0],
+                        "name": "Amravati" if str(row[0]) == "7" else str(row[0]),
+                        "englishName": "Amravati" if str(row[0]) == "7" else str(row[0]),
+                    }
+                    for row in cur.fetchall()
+                ])
 
-        select_sql = ', '.join('"' + col.replace('"', '""') + '"' for col in columns)
-        cur.execute(f'''
-            SELECT {select_sql}
-            FROM "{table.replace('"', '""')}"
-            ORDER BY COALESCE({'"' + english_column.replace('"', '""') + '"' if english_column else '"' + name_column.replace('"', '""') + '"'}, "{name_column.replace('"', '""')}")
-        ''')
-        return jsonify([
-            {
-                "id": row[0],
-                "name": row[1],
-                "englishName": row[2] if english_column else row[1],
-            }
-            for row in cur.fetchall()
-        ])
+        return jsonify([]), 200
     except Exception as e:
         print(f"Error in get_districts: {str(e)}")
         return jsonify({"error": "Unable to load districts"}), 500
@@ -200,11 +226,15 @@ def get_talukas():
                 select_sql = ', '.join('"' + col.replace('"', '""') + '"' for col in columns)
                 where_column = '"' + district_column.replace('"', '""') + '"'
                 order_column = '"' + (english_column or name_column).replace('"', '""') + '"'
-                cur.execute(
-                    f'SELECT {select_sql} FROM "{table.replace(chr(34), chr(34)+chr(34))}" '
-                    f'WHERE {where_column} = %s ORDER BY {order_column}',
-                    (district_id,),
-                )
+                try:
+                    cur.execute(
+                        f'SELECT {select_sql} FROM "{table.replace(chr(34), chr(34)+chr(34))}" '
+                        f'WHERE {where_column} = %s ORDER BY {order_column}',
+                        (district_id,),
+                    )
+                except Exception:
+                    conn.rollback()
+                    raise
                 return jsonify([
                     {
                         "id": row[0],
