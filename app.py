@@ -232,10 +232,7 @@ def get_talukas():
                         f'WHERE {where_column} = %s ORDER BY {order_column}',
                         (district_id,),
                     )
-                except Exception:
-                    conn.rollback()
-                    raise
-                return jsonify([
+                    return jsonify([
                     {
                         "id": row[0],
                         "name": row[1],
