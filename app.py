@@ -836,6 +836,226 @@ def get_properties_from_api():
         print(f"Error in get_properties_from_api: {str(e)}")
         return jsonify({"error": f"Server error: {str(e)}"}), 500
 
+
+def _normalize_survey_geometry(raw_geometry):
+    """
+    Normalize the authoritative survey geometry returned by Bhu-Nakasha.
+
+    The upstream service may return GeoJSON as an object or as a JSON-encoded
+    string. We intentionally do not construct geometry for sub-survey records.
+    """
+    if raw_geometry is None:
+        return None
+
+    if isinstance(raw_geometry, dict):
+        if raw_geometry.get("type"):
+            return raw_geometry
+
+        # Some upstream responses wrap the GeoJSON object.
+        for key in ("geometry", "geojson", "the_geom"):
+            nested = raw_geometry.get(key)
+            if isinstance(nested, dict) and nested.get("type"):
+                return nested
+
+    if isinstance(raw_geometry, str):
+        value = raw_geometry.strip()
+        if not value:
+            return None
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, dict) and parsed.get("type"):
+                return parsed
+        except (TypeError, json.JSONDecodeError):
+            pass
+
+    return None
+
+
+def _normalize_survey_records(raw_info):
+    """
+    Normalize the sub-survey/land-record attributes returned in plotInfo['info'].
+
+    Geometry is deliberately excluded here: the current source provides the
+    survey-level geometry, but not authoritative geometry for each sub-survey.
+    """
+    if raw_info is None:
+        return []
+
+    if isinstance(raw_info, str):
+        return [
+            {
+                "survey_number": item.get("plotNumber"),
+                "area": item.get("plotArea"),
+                "pot_kharab": item.get("potKharab"),
+                "owner_name": item.get("ownerName"),
+                "khata_number": item.get("khataNo"),
+            }
+            for item in getPlotInfoFromString(raw_info)
+        ]
+
+    if not isinstance(raw_info, list):
+        return []
+
+    records = []
+    for item in raw_info:
+        if not isinstance(item, dict):
+            continue
+
+        def first_value(*keys):
+            for key in keys:
+                if key in item and item[key] not in (None, ""):
+                    return item[key]
+            return None
+
+        records.append({
+            "survey_number": first_value(
+                "surveyNumber", "survey_number", "plotNumber", "plotnumber",
+                "Survey No.", "SurveyNo", "surveyNo"
+            ),
+            "area": first_value(
+                "totalArea", "Total Area", "plotArea", "plot_area", "area"
+            ),
+            "pot_kharab": first_value(
+                "potKharaba", "Pot kharaba", "potKharab", "pot_kharab"
+            ),
+            "owner_name": first_value(
+                "ownerName", "Owner Name", "owner_name", "ownername"
+            ),
+            "khata_number": first_value(
+                "khataNo", "Khata No.", "khata_number", "khatanumber"
+            ),
+            "record_type": first_value(
+                "recordType", "record_type", "type", "description", "remark"
+            ),
+        })
+
+    return records
+
+
+@app.route('/getSurveyData')
+@cache.cached(timeout=24 * 60 * 60, query_string=True)
+def get_survey_data():
+    """
+    Survey-level intelligence payload for the new Land Intelligence application.
+
+    Input:
+      ?survey_number_id=<surveyNumber>_<villageId>
+
+    This endpoint is an adapter around the existing Bhu-Nakasha acquisition
+    helpers. It exposes the complete survey-level payload needed by the product
+    without exposing cookies or requiring the frontend to understand the
+    upstream API shape.
+
+    Important data boundary:
+      - survey geometry: authoritative and available when returned upstream
+      - sub-survey attributes: available
+      - sub-survey geometry: not available from this source
+    """
+    try:
+        survey_number_id = request.args.get('survey_number_id')
+        if not survey_number_id:
+            return jsonify({"error": "survey_number_id is required"}), 400
+
+        parts = survey_number_id.split('_')
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            return jsonify({
+                "error": "Invalid survey_number_id format. Expected: 'surveyNumber_villageId'"
+            }), 400
+
+        survey_number, village_id = parts
+
+        conn, cur = get_db_cursor(DatabaseConfig.get_config())
+        cur.execute("SELECT data FROM cookies ORDER BY id DESC LIMIT 1")
+        cookie_data = cur.fetchone()
+
+        if not cookie_data:
+            return jsonify({"error": "No cookies found in database"}), 404
+
+        cookies = cookie_data[0]
+
+        plot_info, cookies = getPlotInfo(
+            survey_number,
+            village_id,
+            cookies,
+        )
+
+        if not plot_info or not plot_info.get("plotid"):
+            return jsonify({
+                "error": "Failed to fetch survey information from Bhu-Nakasha"
+            }), 502
+
+        plot_id = plot_info["plotid"]
+
+        geo_info, _ = getGeoInfo(
+            plot_id,
+            village_id,
+            cookies,
+        )
+
+        if not geo_info:
+            return jsonify({
+                "error": "Failed to fetch survey extent from Bhu-Nakasha"
+            }), 502
+
+        # Prefer geometry from the plot-info response. getExtentGeoref is used
+        # for the authoritative survey bbox, not as a replacement for polygon
+        # geometry.
+        raw_geometry = (
+            plot_info.get("the_geom")
+            or plot_info.get("geometry")
+            or plot_info.get("geojson")
+        )
+        geometry = _normalize_survey_geometry(raw_geometry)
+
+        bbox = {
+            "xmin": geo_info.get("xmin", plot_info.get("xmin")),
+            "ymin": geo_info.get("ymin", plot_info.get("ymin")),
+            "xmax": geo_info.get("xmax", plot_info.get("xmax")),
+            "ymax": geo_info.get("ymax", plot_info.get("ymax")),
+        }
+
+        records = _normalize_survey_records(plot_info.get("info"))
+
+        owner_names = [
+            record["owner_name"]
+            for record in records
+            if record.get("owner_name")
+        ]
+        unique_owners = list(dict.fromkeys(owner_names))
+
+        return jsonify({
+            "survey": {
+                "number": survey_number,
+                "survey_number_id": survey_number_id,
+                "village_id": village_id,
+                "plot_id": plot_id,
+                "gis_code": plot_info.get("giscode"),
+                "area_sq_m": plot_info.get("area"),
+            },
+            "geometry": geometry,
+            "geometry_available": geometry is not None,
+            "sub_survey_geometry_available": False,
+            "bbox": bbox,
+            "records": records,
+            "summary": {
+                "record_count": len(records),
+                "owner_count": len(unique_owners),
+                "owners": unique_owners,
+            },
+            "source": {
+                "provider": "Maharashtra Bhu-Nakasha",
+                "survey_geometry": "getPlotInfo.the_geom",
+                "survey_extent": "getExtentGeoref",
+                "land_records": "getPlotInfo.info",
+            },
+        }), 200
+
+    except Exception as e:
+        print(f"Error in get_survey_data: {str(e)}")
+        return jsonify({
+            "error": f"Server error: {str(e)}"
+        }), 500
+
 if __name__ == '__main__':
     app.debug = True
     app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=True)
