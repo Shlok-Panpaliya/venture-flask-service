@@ -99,6 +99,61 @@ def get_cookies():
         return jsonify({"error": f"Server error: {str(e)}"}), 500
 
 
+@app.route('/getDistricts')
+@cache.cached(timeout=24 * 60 * 60, query_string=True)
+def get_districts():
+    """Return districts for the Land Intelligence location selector."""
+    try:
+        conn, cur = get_db_cursor(DatabaseConfig.get_config())
+        cur.execute("""
+            SELECT id, name, english_name
+            FROM district
+            ORDER BY COALESCE(english_name, name), name
+        """)
+        columns = [desc[0] for desc in cur.description]
+        return jsonify([
+            {
+                "id": row[0],
+                "name": row[1],
+                "englishName": row[2],
+            }
+            for row in cur.fetchall()
+        ])
+    except Exception as e:
+        print(f"Error in get_districts: {str(e)}")
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
+
+
+@app.route('/getTalukas')
+@cache.cached(timeout=24 * 60 * 60, query_string=True)
+def get_talukas():
+    """Return talukas belonging to a district."""
+    district_id = request.args.get('district_id')
+    if not district_id:
+        return jsonify({"error": "district_id is required"}), 400
+
+    try:
+        conn, cur = get_db_cursor(DatabaseConfig.get_config())
+        cur.execute("""
+            SELECT id, name, english_name, district_id
+            FROM taluka
+            WHERE district_id = %s
+            ORDER BY COALESCE(english_name, name), name
+        """, (district_id,))
+        return jsonify([
+            {
+                "id": row[0],
+                "name": row[1],
+                "englishName": row[2],
+                "districtId": row[3],
+            }
+            for row in cur.fetchall()
+        ])
+    except Exception as e:
+        print(f"Error in get_talukas: {str(e)}")
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
+
+
 @app.route('/getVillages')
 @cache.cached(timeout=24 * 60 * 60, query_string=True)
 def get_villages():
