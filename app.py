@@ -837,12 +837,46 @@ def get_properties_from_api():
         return jsonify({"error": f"Server error: {str(e)}"}), 500
 
 
+def _parse_wkt_coordinates(text):
+    """Parse the numeric coordinate nesting from a WKT polygon string."""
+    import re
+
+    tokens = re.findall(r"\\(|\\)|[-+]?(?:\\d+\\.?\\d*|\\.\\d+)(?:[eE][-+]?\\d+)?", text)
+    root = []
+    stack = [root]
+    pair = []
+    depth = 0
+
+    for token in tokens:
+        if token == "(":
+            child = []
+            stack[-1].append(child)
+            stack.append(child)
+            pair = []
+            depth += 1
+        elif token == ")":
+            if pair:
+                stack[-1].append(pair)
+                pair = []
+            if len(stack) > 1:
+                stack.pop()
+            depth -= 1
+        else:
+            pair.append(float(token))
+            if len(pair) == 2:
+                stack[-1].append(pair)
+                pair = []
+
+    return root
+
+
 def _normalize_survey_geometry(raw_geometry):
     """
     Normalize the authoritative survey geometry returned by Bhu-Nakasha.
 
-    The upstream service may return GeoJSON as an object or as a JSON-encoded
-    string. We intentionally do not construct geometry for sub-survey records.
+    Bhu-Nakasha may return GeoJSON as an object/JSON string or the survey
+    geometry as WKT, e.g. MULTIPOLYGON (((lon lat, ...))). We convert only
+    the survey-level geometry; no sub-survey geometry is inferred.
     """
     if raw_geometry is None:
         return None
@@ -851,22 +885,36 @@ def _normalize_survey_geometry(raw_geometry):
         if raw_geometry.get("type"):
             return raw_geometry
 
-        # Some upstream responses wrap the GeoJSON object.
         for key in ("geometry", "geojson", "the_geom"):
             nested = raw_geometry.get(key)
-            if isinstance(nested, dict) and nested.get("type"):
-                return nested
+            normalized = _normalize_survey_geometry(nested)
+            if normalized:
+                return normalized
+        return None
 
-    if isinstance(raw_geometry, str):
-        value = raw_geometry.strip()
-        if not value:
-            return None
-        try:
-            parsed = json.loads(value)
-            if isinstance(parsed, dict) and parsed.get("type"):
-                return parsed
-        except (TypeError, json.JSONDecodeError):
-            pass
+    if not isinstance(raw_geometry, str):
+        return None
+
+    value = raw_geometry.strip()
+    if not value:
+        return None
+
+    # First handle JSON-encoded GeoJSON.
+    try:
+        parsed = json.loads(value)
+        if isinstance(parsed, dict) and parsed.get("type"):
+            return parsed
+    except (TypeError, json.JSONDecodeError):
+        pass
+
+    upper = value.upper()
+    if upper.startswith("MULTIPOLYGON"):
+        coordinates = _parse_wkt_coordinates(value[len("MULTIPOLYGON"):])
+        return {"type": "MultiPolygon", "coordinates": coordinates}
+
+    if upper.startswith("POLYGON"):
+        coordinates = _parse_wkt_coordinates(value[len("POLYGON"):])
+        return {"type": "Polygon", "coordinates": coordinates}
 
     return None
 
