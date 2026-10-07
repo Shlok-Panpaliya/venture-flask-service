@@ -214,46 +214,52 @@ def get_talukas():
     try:
         conn, cur = get_db_cursor(DatabaseConfig.get_config())
         table = _find_relation(cur, ['taluka', 'talukas'])
+
         if table:
             id_column = _find_column(cur, table, ['id', 'taluka_id'])
             name_column = _find_column(cur, table, ['name', 'taluka_name'])
             english_column = _find_column(cur, table, ['english_name', 'englishname', 'english_name_en'])
             district_column = _find_column(cur, table, ['district_id', 'districtId'])
+
             if id_column and name_column and district_column:
                 columns = [id_column, name_column]
                 if english_column and english_column not in columns:
                     columns.append(english_column)
+
                 select_sql = ', '.join('"' + col.replace('"', '""') + '"' for col in columns)
+                table_sql = '"' + table.replace('"', '""') + '"'
                 where_column = '"' + district_column.replace('"', '""') + '"'
                 order_column = '"' + (english_column or name_column).replace('"', '""') + '"'
+
                 try:
                     cur.execute(
-                        f'SELECT {select_sql} FROM "{table.replace(chr(34), chr(34)+chr(34))}" '
+                        f'SELECT {select_sql} FROM {table_sql} '
                         f'WHERE {where_column} = %s ORDER BY {order_column}',
                         (district_id,),
                     )
+                except Exception:
+                    conn.rollback()
+                else:
                     return jsonify([
-                    {
-                        "id": row[0],
-                        "name": row[1],
-                        "englishName": row[2] if english_column else row[1],
-                        "districtId": district_id,
-                    }
-                    for row in cur.fetchall()
-                ])
+                        {
+                            "id": row[0],
+                            "name": row[1],
+                            "englishName": row[2] if english_column else row[1],
+                            "districtId": district_id,
+                        }
+                        for row in cur.fetchall()
+                    ])
 
-        # Fallback: the existing village table is authoritative for the
-        # taluka identifiers used by the application. This keeps the selector
-        # functional even when a separate taluka lookup table is unavailable.
+        # Fallback: derive taluka identifiers from the existing village table.
         village_table = _find_relation(cur, ['village', 'villages'])
         if village_table:
             taluka_column = _find_column(cur, village_table, ['taluka_id', 'talukaId'])
             if taluka_column:
+                tc = '"' + taluka_column.replace('"', '""') + '"'
+                vc = '"' + village_table.replace('"', '""') + '"'
                 cur.execute(
-                    f'SELECT DISTINCT "{taluka_column.replace(chr(34), chr(34)+chr(34))}" '
-                    f'FROM "{village_table.replace(chr(34), chr(34)+chr(34))}" '
-                    f'WHERE "{taluka_column.replace(chr(34), chr(34)+chr(34))}" IS NOT NULL '
-                    f'ORDER BY "{taluka_column.replace(chr(34), chr(34)+chr(34))}"'
+                    f'SELECT DISTINCT {tc} FROM {vc} '
+                    f'WHERE {tc} IS NOT NULL ORDER BY {tc}'
                 )
                 return jsonify([
                     {
