@@ -99,29 +99,82 @@ def get_cookies():
         return jsonify({"error": f"Server error: {str(e)}"}), 500
 
 
+def _find_relation(cur, candidates):
+    cur.execute("""
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name = ANY(%s)
+        ORDER BY array_position(%s, table_name)
+        LIMIT 1
+    """, (candidates, candidates))
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+def _find_column(cur, table_name, candidates):
+    cur.execute("""
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = %s
+          AND column_name = ANY(%s)
+        ORDER BY array_position(%s, column_name)
+        LIMIT 1
+    """, (table_name, candidates, candidates))
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+def _location_value(row, column_names, preferred):
+    if not row:
+        return None
+    value = row.get(preferred)
+    if value is not None:
+        return value
+    for name in column_names:
+        if row.get(name) is not None:
+            return row[name]
+    return None
+
+
 @app.route('/getDistricts')
 @cache.cached(timeout=24 * 60 * 60, query_string=True)
 def get_districts():
     """Return districts for the Land Intelligence location selector."""
     try:
         conn, cur = get_db_cursor(DatabaseConfig.get_config())
-        cur.execute("""
-            SELECT id, name, english_name
-            FROM district
-            ORDER BY COALESCE(english_name, name), name
-        """)
-        columns = [desc[0] for desc in cur.description]
+        table = _find_relation(cur, ['district', 'districts'])
+        if not table:
+            return jsonify([])
+
+        id_column = _find_column(cur, table, ['id', 'district_id'])
+        name_column = _find_column(cur, table, ['name', 'district_name'])
+        english_column = _find_column(cur, table, ['english_name', 'englishname', 'english_name_en'])
+        if not id_column or not name_column:
+            return jsonify([])
+
+        columns = [id_column, name_column]
+        if english_column and english_column not in columns:
+            columns.append(english_column)
+
+        select_sql = ', '.join('"' + col.replace('"', '""') + '"' for col in columns)
+        cur.execute(f'''
+            SELECT {select_sql}
+            FROM "{table.replace('"', '""')}"
+            ORDER BY COALESCE({'"' + english_column.replace('"', '""') + '"' if english_column else '"' + name_column.replace('"', '""') + '"'}, "{name_column.replace('"', '""')}")
+        ''')
         return jsonify([
             {
                 "id": row[0],
                 "name": row[1],
-                "englishName": row[2],
+                "englishName": row[2] if english_column else row[1],
             }
             for row in cur.fetchall()
         ])
     except Exception as e:
         print(f"Error in get_districts: {str(e)}")
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+        return jsonify({"error": "Unable to load districts"}), 500
 
 
 @app.route('/getTalukas')
@@ -134,24 +187,61 @@ def get_talukas():
 
     try:
         conn, cur = get_db_cursor(DatabaseConfig.get_config())
-        cur.execute("""
-            SELECT id, name, english_name, district_id
-            FROM taluka
-            WHERE district_id = %s
-            ORDER BY COALESCE(english_name, name), name
-        """, (district_id,))
-        return jsonify([
-            {
-                "id": row[0],
-                "name": row[1],
-                "englishName": row[2],
-                "districtId": row[3],
-            }
-            for row in cur.fetchall()
-        ])
+        table = _find_relation(cur, ['taluka', 'talukas'])
+        if table:
+            id_column = _find_column(cur, table, ['id', 'taluka_id'])
+            name_column = _find_column(cur, table, ['name', 'taluka_name'])
+            english_column = _find_column(cur, table, ['english_name', 'englishname', 'english_name_en'])
+            district_column = _find_column(cur, table, ['district_id', 'districtId'])
+            if id_column and name_column and district_column:
+                columns = [id_column, name_column]
+                if english_column and english_column not in columns:
+                    columns.append(english_column)
+                select_sql = ', '.join('"' + col.replace('"', '""') + '"' for col in columns)
+                where_column = '"' + district_column.replace('"', '""') + '"'
+                order_column = '"' + (english_column or name_column).replace('"', '""') + '"'
+                cur.execute(
+                    f'SELECT {select_sql} FROM "{table.replace(chr(34), chr(34)+chr(34))}" '
+                    f'WHERE {where_column} = %s ORDER BY {order_column}',
+                    (district_id,),
+                )
+                return jsonify([
+                    {
+                        "id": row[0],
+                        "name": row[1],
+                        "englishName": row[2] if english_column else row[1],
+                        "districtId": district_id,
+                    }
+                    for row in cur.fetchall()
+                ])
+
+        # Fallback: the existing village table is authoritative for the
+        # taluka identifiers used by the application. This keeps the selector
+        # functional even when a separate taluka lookup table is unavailable.
+        village_table = _find_relation(cur, ['village', 'villages'])
+        if village_table:
+            taluka_column = _find_column(cur, village_table, ['taluka_id', 'talukaId'])
+            if taluka_column:
+                cur.execute(
+                    f'SELECT DISTINCT "{taluka_column.replace(chr(34), chr(34)+chr(34))}" '
+                    f'FROM "{village_table.replace(chr(34), chr(34)+chr(34))}" '
+                    f'WHERE "{taluka_column.replace(chr(34), chr(34)+chr(34))}" IS NOT NULL '
+                    f'ORDER BY "{taluka_column.replace(chr(34), chr(34)+chr(34))}"'
+                )
+                return jsonify([
+                    {
+                        "id": row[0],
+                        "name": str(row[0]),
+                        "englishName": str(row[0]),
+                        "districtId": district_id,
+                    }
+                    for row in cur.fetchall()
+                ])
+
+        return jsonify([])
     except Exception as e:
         print(f"Error in get_talukas: {str(e)}")
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+        return jsonify({"error": "Unable to load talukas"}), 500
 
 
 @app.route('/getVillages')
